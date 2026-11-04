@@ -1,0 +1,184 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: reader-v0-1-0-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pnpm install --frozen-lockfile || pnpm install
+      - run: pnpm test
+      - run: pnpm build
+      - run: node scripts/check-bundle-budget.mjs
+      - run: cargo test -p reader-core
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pnpm install --frozen-lockfile || pnpm install
+      - name: Portable Windows exe
+        run: pnpm tauri build --no-bundle --ci
+      - name: Collect exe
+        shell: bash
+        run: |
+          mkdir -p collect
+          dirs=()
+          [ -d src-tauri/target ] && dirs+=(src-tauri/target)
+          [ -d target ] && dirs+=(target)
+          exe=$(/usr/bin/find "${dirs[@]}" -type f -path '*/release/reader.exe' | /usr/bin/head -n 1) || true
+          echo "found: ${exe:-none}"
+          test -n "$exe"
+          cp "$exe" collect/Reader-windows-x64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reader-windows-x64
+          path: collect/*
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pnpm install --frozen-lockfile || pnpm install
+      - name: Apple Silicon app
+        run: |
+          unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_BASE64 APPLE_TEAM_ID TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD || true
+          set +e
+          pnpm tauri build --bundles app --ci --no-sign --verbose >"$RUNNER_TEMP/tauri-mac.log" 2>&1
+          code=$?
+          set -e
+          if [ "$code" -ne 0 ]; then
+            payload=$(tail -n 20 "$RUNNER_TEMP/tauri-mac.log" | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g; s/::/%3A%3A/g' | tr '\n' '~')
+            echo "::error title=tauri-macos::$payload"
+            exit "$code"
+          fi
+      - name: Zip Apple Silicon app
+        run: |
+          mkdir -p collect
+          dirs=()
+          [ -d src-tauri/target ] && dirs+=(src-tauri/target)
+          [ -d target ] && dirs+=(target)
+          app=$(/usr/bin/find "${dirs[@]}" -type d -path '*/release/bundle/macos/Reader.app' | /usr/bin/head -n 1) || true
+          echo "found: ${app:-none}"
+          test -n "$app"
+          ditto -c -k --keepParent "$app" collect/Reader-macos-arm64.zip
+      - name: Intel app
+        continue-on-error: true
+        run: |
+          rustup target add x86_64-apple-darwin
+          pnpm tauri build --bundles app --target x86_64-apple-darwin --ci --no-sign
+          dirs=()
+          [ -d src-tauri/target ] && dirs+=(src-tauri/target)
+          [ -d target ] && dirs+=(target)
+          app=$(/usr/bin/find "${dirs[@]}" -type d -path '*/x86_64-apple-darwin/release/bundle/macos/Reader.app' | /usr/bin/head -n 1) || true
+          echo "found: ${app:-none}"
+          test -n "$app"
+          ditto -c -k --keepParent "$app" collect/Reader-macos-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reader-macos
+          path: collect/*
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libfuse2
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pnpm install --frozen-lockfile || pnpm install
+      - name: AppImage
+        run: pnpm tauri build --bundles appimage --ci
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p collect
+          dirs=()
+          [ -d src-tauri/target ] && dirs+=(src-tauri/target)
+          [ -d target ] && dirs+=(target)
+          img=$(/usr/bin/find "${dirs[@]}" -type f -path '*/release/bundle/appimage/*.AppImage' | /usr/bin/head -n 1) || true
+          echo "found: ${img:-none}"
+          test -n "$img"
+          cp "$img" collect/Reader-linux-x64.AppImage
+          chmod +x collect/Reader-linux-x64.AppImage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reader-linux-x64
+          path: collect/*
+          if-no-files-found: error
+
+  publish:
+    needs: [test, windows, macos, linux]
+    if: always() && needs.test.result == 'success' && needs.windows.result == 'success' && needs.macos.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: reader-*
+          path: release
+          merge-multiple: true
+      - name: SHA256SUMS
+        run: |
+          cd release
+          rm -f SHA256SUMS
+          sha256sum Reader-* | tee SHA256SUMS
+          echo
+          ls -lh
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          tag=v0.1.0
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" release/* --clobber >"$RUNNER_TEMP/gh.log" 2>&1
+            code=$?
+            if [ "$code" -eq 0 ]; then
+              gh release edit "$tag" --notes-file artifacts/RELEASE_NOTES.md --title "Reader 0.1.0 alpha" --prerelease >"$RUNNER_TEMP/gh.log" 2>&1
+              code=$?
+            fi
+          else
+            gh release create "$tag" release/* --target "${{ github.sha }}" --title "Reader 0.1.0 alpha" --notes-file artifacts/RELEASE_NOTES.md --prerelease >"$RUNNER_TEMP/gh.log" 2>&1
+            code=$?
+          fi
+          if [ "$code" -ne 0 ]; then
+            payload=$(tail -n 30 "$RUNNER_TEMP/gh.log" | tr '\n' '~' | sed 's/::/%3A%3A/g')
+            echo "::error title=gh-release::$payload"
+            exit "$code"
+          fi
+          gh release view "$tag" --json url,assets --jq '{url: .url, assets: [.assets[].name]}'

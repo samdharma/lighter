@@ -1,0 +1,49 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Reader",
+  "version": "0.1.0",
+  "identifier": "dev.reader.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "node scripts/before-build.mjs || node ../scripts/before-build.mjs"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "security": {
+      "csp": "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; frame-src 'none'; object-src 'none'; form-action 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: reader: http://reader.localhost https: http:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420 reader: http://reader.localhost; worker-src 'self' blob:; media-src 'none'"
+    },
+    "windows": []
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "appimage"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "publisher": "Reader contributors",
+    "copyright": "Copyright Reader contributors",
+    "shortDescription": "Lightweight PDF and Markdown reader",
+    "longDescription": "Open a local PDF or Markdown file. Reader detects the format from the contents and does not phone home.",
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": true
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      }
+    },
+    "createUpdaterArtifacts": false
+  }
+}

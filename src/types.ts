@@ -36,6 +36,8 @@ export type Settings = {
   recent: string[];
   positions: ReadingPosition[];
   remoteAllowed: string[];
+  chromeAutoHide: boolean;
+  gestureZoom: boolean;
 };
 
 export type UiError = {

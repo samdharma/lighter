@@ -4,6 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { MarkdownView } from "./markdown/MarkdownView";
 import type { Heading } from "./markdown/text";
 import { PdfView } from "./pdf/PdfView";
+import { clampZoom, zoomFromGesture, zoomFromWheel } from "./lib/zoom";
 import {
   clearRecent,
   closeDocument,
@@ -43,6 +44,8 @@ const DEFAULT_SETTINGS: Settings = {
   recent: [],
   positions: [],
   remoteAllowed: [],
+  chromeAutoHide: true,
+  gestureZoom: true,
 };
 
 export function App() {
@@ -65,10 +68,17 @@ export function App() {
   const [pendingLink, setPendingLink] = useState<string | null>(null);
   const [blockedLink, setBlockedLink] = useState<string | null>(null);
   const [shell, setShell] = useState(true);
+  const [chromeOn, setChromeOn] = useState(true);
+  const [badgeOn, setBadgeOn] = useState(false);
   const findRef = useRef<HTMLInputElement>(null);
   const runRef = useRef<(action: string) => void>(() => undefined);
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  const hideTimer = useRef<number | undefined>(undefined);
+  const lastPoke = useRef(0);
+  const persistTimer = useRef<number | undefined>(undefined);
+  const badgeTimer = useRef<number | undefined>(undefined);
+  const badgeSeen = useRef(false);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -118,6 +128,64 @@ export function App() {
     };
   }, []);
 
+  // Chrome auto-hide: any mouse or key activity reveals it; it fades after
+  // a short idle and stays down while scrolling.
+  useEffect(() => {
+    const poke = () => {
+      const now = Date.now();
+      if (now - lastPoke.current < 120) return;
+      lastPoke.current = now;
+      setChromeOn(true);
+      window.clearTimeout(hideTimer.current);
+      if (settingsRef.current.chromeAutoHide) {
+        hideTimer.current = window.setTimeout(() => setChromeOn(false), 1600);
+      }
+    };
+    const onKey = () => {
+      lastPoke.current = 0;
+      poke();
+    };
+    window.addEventListener("mousemove", poke);
+    window.addEventListener("keydown", onKey);
+    poke();
+    return () => {
+      window.removeEventListener("mousemove", poke);
+      window.removeEventListener("keydown", onKey);
+      window.clearTimeout(hideTimer.current);
+    };
+  }, []);
+
+  // Gesture zoom: Ctrl+wheel covers Chromium pinch (Windows/WebView2);
+  // gesturestart/change covers WKWebView trackpad pinch (macOS).
+  useEffect(() => {
+    const onWheel = (event: WheelEvent) => {
+      if (!event.ctrlKey || !settingsRef.current.gestureZoom) return;
+      event.preventDefault();
+      setScaleMode("custom");
+      applyZoom(zoomFromWheel(settingsRef.current.zoom, event.deltaY));
+    };
+    let gestureStartZoom = 1;
+    const onGestureStart = (event: Event) => {
+      if (!settingsRef.current.gestureZoom) return;
+      event.preventDefault();
+      gestureStartZoom = settingsRef.current.zoom;
+    };
+    const onGestureChange = (event: Event) => {
+      if (!settingsRef.current.gestureZoom) return;
+      event.preventDefault();
+      setScaleMode("custom");
+      applyZoom(zoomFromGesture(gestureStartZoom, (event as unknown as { scale: number }).scale));
+    };
+    window.addEventListener("wheel", onWheel, { passive: false });
+    window.addEventListener("gesturestart", onGestureStart);
+    window.addEventListener("gesturechange", onGestureChange);
+    return () => {
+      window.removeEventListener("wheel", onWheel);
+      window.removeEventListener("gesturestart", onGestureStart);
+      window.removeEventListener("gesturechange", onGestureChange);
+    };
+  }, []);
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const meta = event.metaKey || event.ctrlKey;
@@ -160,6 +228,18 @@ export function App() {
     if (findOpen) findRef.current?.focus();
   }, [findOpen]);
 
+  const zoomPct = Math.round((scaleMode === "custom" ? settings.zoom : metrics.scale) * 100);
+  useEffect(() => {
+    if (!badgeSeen.current) {
+      badgeSeen.current = true;
+      return;
+    }
+    setBadgeOn(true);
+    window.clearTimeout(badgeTimer.current);
+    badgeTimer.current = window.setTimeout(() => setBadgeOn(false), 1100);
+    return () => window.clearTimeout(badgeTimer.current);
+  }, [zoomPct]);
+
   async function adopt(info: Opened): Promise<void> {
     setOutline([]);
     setHeadings([]);
@@ -192,6 +272,16 @@ export function App() {
     setSettings(saved);
   }
 
+  function applyZoom(next: number): void {
+    const zoom = clampZoom(next);
+    const updated = { ...settingsRef.current, zoom };
+    setSettings(updated);
+    window.clearTimeout(persistTimer.current);
+    persistTimer.current = window.setTimeout(() => {
+      if (inShell()) void updateSettings(settingsRef.current);
+    }, 400);
+  }
+
   async function openFromDialog(): Promise<void> {
     if (!inShell()) return;
     const path = await pickPath();
@@ -212,11 +302,15 @@ export function App() {
     else if (action === "toggle-mode" && phase.kind === "md") {
       const markdownMode = settings.markdownMode === "raw" ? "rendered" : "raw";
       void persist({ ...settings, markdownMode });
-    } else if (action === "zoom-in") void persist({ ...settings, zoom: clampZoom(settings.zoom * 1.1) });
-    else if (action === "zoom-out") void persist({ ...settings, zoom: clampZoom(settings.zoom / 1.1) });
-    else if (action === "zoom-reset") {
+    } else if (action === "zoom-in") {
+      setScaleMode("custom");
+      applyZoom(settings.zoom * 1.15);
+    } else if (action === "zoom-out") {
+      setScaleMode("custom");
+      applyZoom(settings.zoom / 1.15);
+    } else if (action === "zoom-reset") {
       setScaleMode("actual");
-      void persist({ ...settings, zoom: 1 });
+      applyZoom(1);
     } else if (action === "fit-width") setScaleMode("fit-width");
     else if (action === "fit-page") setScaleMode("fit-page");
     else if (action === "view-continuous") void persist({ ...settings, pdfView: "continuous" });
@@ -236,107 +330,22 @@ export function App() {
   const remoteAllowed = docInfo ? settings.remoteAllowed.includes(docInfo.path) : false;
   const mode = settings.markdownMode === "raw" ? "raw" : "rendered";
   const pdfView = settings.pdfView === "single" ? "single" : "continuous";
+  const chromeOff = settings.chromeAutoHide && !chromeOn && !findOpen;
 
   return (
-    <div class="shell">
-      <header class="topbar">
-        <button type="button" class="primary" onClick={() => runRef.current("open")}>
-          Open
-        </button>
-        <div class="title-block">
-          <strong>{docInfo?.name ?? "Reader"}</strong>
-          {docInfo ? <span class="badge">{docInfo.kind === "pdf" ? "PDF" : "Markdown"}</span> : null}
-        </div>
-        <button type="button" aria-pressed={rail} onClick={() => setRail((open) => !open)}>
-          Contents
-        </button>
-        <button type="button" onClick={() => setFindOpen(true)}>
-          Find
-        </button>
-        {phase.kind === "md" ? (
-          <div class="segmented" role="group" aria-label="Markdown view">
-            <button type="button" aria-pressed={mode === "rendered"} onClick={() => void persist({ ...settings, markdownMode: "rendered" })}>
-              Rendered
-            </button>
-            <button type="button" aria-pressed={mode === "raw"} onClick={() => void persist({ ...settings, markdownMode: "raw" })}>
-              Raw
-            </button>
-          </div>
-        ) : null}
-        {phase.kind === "pdf" ? (
-          <div class="zoom-group">
-            <button type="button" onClick={() => runRef.current("zoom-out")} aria-label="Zoom out">
-              −
-            </button>
-            <span class="zoom-readout">{Math.round((scaleMode === "custom" ? settings.zoom : metrics.scale) * 100)}%</span>
-            <button type="button" onClick={() => runRef.current("zoom-in")} aria-label="Zoom in">
-              +
-            </button>
-            <button type="button" onClick={() => setScaleMode("fit-width")}>
-              Fit width
-            </button>
-            <button type="button" onClick={() => setScaleMode("fit-page")}>
-              Fit page
-            </button>
-          </div>
-        ) : null}
-        <details class="overflow">
-          <summary aria-label="More actions">More</summary>
-          <div class="menu-pop">
-            <button type="button" onClick={() => void persist({ ...settings, theme: "system" })}>Theme: System</button>
-            <button type="button" onClick={() => void persist({ ...settings, theme: "light" })}>Theme: Light</button>
-            <button type="button" onClick={() => void persist({ ...settings, theme: "dark" })}>Theme: Dark</button>
-            {phase.kind === "pdf" ? (
-              <>
-                <button type="button" onClick={() => runRef.current("rotate-ccw")}>Rotate left</button>
-                <button type="button" onClick={() => runRef.current("rotate-cw")}>Rotate right</button>
-                <button type="button" onClick={() => void persist({ ...settings, pdfView: pdfView === "single" ? "continuous" : "single" })}>
-                  {pdfView === "single" ? "Continuous scroll" : "Single page"}
-                </button>
-              </>
-            ) : null}
-            <button type="button" onClick={() => setShortcuts(true)}>Keyboard shortcuts</button>
-            {docInfo ? <button type="button" onClick={() => runRef.current("close-doc")}>Close</button> : null}
-          </div>
-        </details>
-      </header>
-      {findOpen ? (
-        <form
-          class="findbar"
-          onSubmit={(event) => {
-            event.preventDefault();
-            setCursor((value) => (matchCount === 0 ? 0 : (value + 1) % matchCount));
-          }}
-        >
-          <label>
-            Find
-            <input
-              ref={findRef}
-              value={query}
-              onInput={(event) => {
-                setQuery(event.currentTarget.value);
-                setCursor(0);
-              }}
-              aria-label="Find in document"
-            />
-          </label>
-          <span class="match-count">{searching ? "Searching…" : query.trim() ? `${matchCount === 0 ? 0 : cursor + 1} of ${matchCount}` : ""}</span>
-          <button type="button" onClick={() => setCursor((value) => (matchCount === 0 ? 0 : (value - 1 + matchCount) % matchCount))} aria-label="Previous match">
-            Previous
-          </button>
-          <button type="submit">Next</button>
-          <button type="button" onClick={() => setFindOpen(false)} aria-label="Close find">
-            Close
-          </button>
-        </form>
-      ) : null}
+    <div
+      class="shell"
+      onScrollCapture={() => {
+        if (settingsRef.current.chromeAutoHide) setChromeOn(false);
+      }}
+    >
       <div class="workspace">
         {rail ? (
           <aside class="rail" aria-label="Contents">
             <div class="rail-head">
               <strong>{phase.kind === "pdf" ? "Outline" : "Contents"}</strong>
-              <button type="button" onClick={() => setRail(false)} aria-label="Close contents">
-                Close
+              <button type="button" class="icon-btn" onClick={() => setRail(false)} aria-label="Close contents" title="Close">
+                ×
               </button>
             </div>
             {phase.kind === "pdf" ? (
@@ -357,8 +366,8 @@ export function App() {
         <main class="canvas">
           {phase.kind === "empty" ? (
             <section class="state">
-              <h1>Open a document</h1>
-              <p>Drop a PDF or Markdown file here, or use Open. Reader decides the format from the file itself — extensions are only a label.</p>
+              <h1>Reader</h1>
+              <p>Drop a PDF or Markdown file anywhere in this window. Reader decides the format from the file itself — extensions are only a label.</p>
               <button type="button" class="primary" onClick={() => runRef.current("open")}>
                 Open…
               </button>
@@ -388,7 +397,9 @@ export function App() {
                   Preview sample note
                 </button>
               ) : null}
-              <p class="hint">From a terminal: <code>reader path/to/notes.md</code></p>
+              <p class="hint">
+                From a terminal: <code>reader path/to/notes.md</code>
+              </p>
             </section>
           ) : null}
           {phase.kind === "loading" ? (
@@ -452,50 +463,159 @@ export function App() {
           ) : null}
         </main>
       </div>
-      <footer class="statusbar">
-        {phase.kind === "pdf" ? (
-          <span class="page-nav">
-            <button type="button" onClick={() => requestPage(metrics.page - 1)} aria-label="Previous page">
-              Prev
+      <div
+        class={`pill float${chromeOff ? " off" : ""}`}
+        onMouseEnter={() => {
+          lastPoke.current = 0;
+          window.clearTimeout(hideTimer.current);
+          setChromeOn(true);
+        }}
+        onMouseLeave={() => {
+          if (settingsRef.current.chromeAutoHide) {
+            window.clearTimeout(hideTimer.current);
+            hideTimer.current = window.setTimeout(() => setChromeOn(false), 1600);
+          }
+        }}
+      >
+        <button type="button" class="icon-btn" aria-pressed={rail} onClick={() => setRail((open) => !open)} title="Contents" aria-label="Contents">
+          ☰
+        </button>
+        <button type="button" class="icon-btn" onClick={() => setFindOpen(true)} title="Find (⌘F)" aria-label="Find">
+          ⌕
+        </button>
+        {phase.kind === "md" ? (
+          <>
+            <span class="sep" />
+            <div class="segmented" role="group" aria-label="Markdown view">
+              <button type="button" aria-pressed={mode === "rendered"} onClick={() => void persist({ ...settings, markdownMode: "rendered" })}>
+                Rendered
+              </button>
+              <button type="button" aria-pressed={mode === "raw"} onClick={() => void persist({ ...settings, markdownMode: "raw" })}>
+                Raw
+              </button>
+            </div>
+          </>
+        ) : null}
+        <span class="sep" />
+        <details class="overflow">
+          <summary aria-label="More actions" title="More">⋯</summary>
+          <div class="menu-pop" onClick={(event) => {
+            if ((event.target as HTMLElement).closest("button")) {
+              (event.currentTarget as HTMLElement).closest("details")?.removeAttribute("open");
+            }
+          }}>
+            <button type="button" onClick={() => runRef.current("open")}>Open…</button>
+            <div class="menu-sep" />
+            <button type="button" aria-pressed={settings.theme === "system"} onClick={() => void persist({ ...settings, theme: "system" })}>Theme: System</button>
+            <button type="button" aria-pressed={settings.theme === "light"} onClick={() => void persist({ ...settings, theme: "light" })}>Theme: Light</button>
+            <button type="button" aria-pressed={settings.theme === "dark"} onClick={() => void persist({ ...settings, theme: "dark" })}>Theme: Dark</button>
+            {phase.kind === "pdf" ? (
+              <>
+                <div class="menu-sep" />
+                <button type="button" onClick={() => runRef.current("rotate-ccw")}>Rotate left</button>
+                <button type="button" onClick={() => runRef.current("rotate-cw")}>Rotate right</button>
+                <button type="button" onClick={() => void persist({ ...settings, pdfView: pdfView === "single" ? "continuous" : "single" })}>
+                  {pdfView === "single" ? "Continuous scroll" : "Single page"}
+                </button>
+                <button type="button" onClick={() => runRef.current("fit-width")}>Fit width</button>
+                <button type="button" onClick={() => runRef.current("fit-page")}>Fit page</button>
+              </>
+            ) : null}
+            {phase.kind === "md" && inShell() ? (
+              <>
+                <div class="menu-sep" />
+                <button
+                  type="button"
+                  onClick={() => {
+                    void setRemoteAllowed(phase.info.path, !remoteAllowed).then(setSettings);
+                  }}
+                >
+                  {remoteAllowed ? "Block remote images" : "Allow remote images"}
+                </button>
+              </>
+            ) : null}
+            <div class="menu-sep" />
+            <button type="button" aria-pressed={settings.chromeAutoHide} onClick={() => void persist({ ...settings, chromeAutoHide: !settings.chromeAutoHide })}>
+              Auto-hide toolbar
             </button>
-            <label>
-              Page
-              <input
-                class="page-input"
-                value={metrics.page}
-                onChange={(event) => requestPage(Number(event.currentTarget.value))}
-                inputMode="numeric"
-                aria-label="Page number"
-              />
-              of {metrics.pages || "…"}
-            </label>
-            <button type="button" onClick={() => requestPage(metrics.page + 1)} aria-label="Next page">
-              Next
+            <button type="button" aria-pressed={settings.gestureZoom} onClick={() => void persist({ ...settings, gestureZoom: !settings.gestureZoom })}>
+              Pinch to zoom
             </button>
-            <span>{pdfView === "single" ? "Single page" : "Continuous"}</span>
-          </span>
-        ) : phase.kind === "md" ? (
-          <span>
+            <button type="button" onClick={() => setShortcuts(true)}>Keyboard shortcuts</button>
+            {docInfo ? (
+              <>
+                <div class="menu-sep" />
+                <button type="button" onClick={() => runRef.current("close-doc")}>Close document</button>
+              </>
+            ) : null}
+          </div>
+        </details>
+      </div>
+      {findOpen ? (
+        <form
+          class="findbar float"
+          onSubmit={(event) => {
+            event.preventDefault();
+            setCursor((value) => (matchCount === 0 ? 0 : (value + 1) % matchCount));
+          }}
+        >
+          <input
+            ref={findRef}
+            value={query}
+            onInput={(event) => {
+              setQuery(event.currentTarget.value);
+              setCursor(0);
+            }}
+            placeholder="Find in document"
+            aria-label="Find in document"
+          />
+          <span class="match-count">{searching ? "…" : query.trim() ? `${matchCount === 0 ? 0 : cursor + 1} / ${matchCount}` : ""}</span>
+          <button type="button" class="icon-btn" onClick={() => setCursor((value) => (matchCount === 0 ? 0 : (value - 1 + matchCount) % matchCount))} aria-label="Previous match" title="Previous match">
+            ‹
+          </button>
+          <button type="submit" class="icon-btn" aria-label="Next match" title="Next match">
+            ›
+          </button>
+          <button type="button" class="icon-btn" onClick={() => setFindOpen(false)} aria-label="Close find" title="Close">
+            ×
+          </button>
+        </form>
+      ) : null}
+      <button
+        type="button"
+        class={`zoom-badge float${badgeOn ? "" : " off"}`}
+        onClick={() => runRef.current("zoom-reset")}
+        title="Reset zoom to 100%"
+        aria-label={`Zoom ${zoomPct} percent. Reset zoom.`}
+      >
+        {zoomPct}%
+      </button>
+      {phase.kind === "pdf" ? (
+        <div class={`chip float${chromeOff ? " off" : ""}`}>
+          <button type="button" class="icon-btn" onClick={() => requestPage(metrics.page - 1)} aria-label="Previous page" title="Previous page">
+            ‹
+          </button>
+          <input
+            class="page-input"
+            value={metrics.page}
+            onChange={(event) => requestPage(Number(event.currentTarget.value))}
+            inputMode="numeric"
+            aria-label="Page number"
+          />
+          <span class="chip-label">/ {metrics.pages || "…"}</span>
+          <button type="button" class="icon-btn" onClick={() => requestPage(metrics.page + 1)} aria-label="Next page" title="Next page">
+            ›
+          </button>
+        </div>
+      ) : phase.kind === "md" ? (
+        <div class={`chip float${chromeOff ? " off" : ""}`}>
+          <span class="chip-label">
             {mode === "raw" ? "Raw" : "Rendered"}
-            {remoteAllowed ? " · remote images allowed" : " · local images only"}
+            {remoteAllowed ? " · remote images" : ""}
             {phase.truncated ? " · truncated" : ""}
           </span>
-        ) : (
-          <span>No document</span>
-        )}
-        {phase.kind === "md" && inShell() ? (
-          <button
-            type="button"
-            onClick={() => {
-              void setRemoteAllowed(phase.info.path, !remoteAllowed).then(setSettings);
-            }}
-          >
-            {remoteAllowed ? "Block remote images" : "Allow remote images"}
-          </button>
-        ) : (
-          <span />
-        )}
-      </footer>
+        </div>
+      ) : null}
       {shortcuts ? (
         <div class="modal-backdrop" onClick={() => setShortcuts(false)}>
           <div class="modal" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title" onClick={(event) => event.stopPropagation()}>
@@ -505,10 +625,13 @@ export function App() {
               <li><kbd>Ctrl/⌘ F</kbd> Find</li>
               <li><kbd>Ctrl/⌘ E</kbd> Rendered / raw</li>
               <li><kbd>Ctrl/⌘ +</kbd> <kbd>Ctrl/⌘ -</kbd> <kbd>Ctrl/⌘ 0</kbd> Zoom</li>
+              <li><kbd>Pinch</kbd> or <kbd>Ctrl + scroll</kbd> Zoom</li>
               <li><kbd>Page Up</kbd> <kbd>Page Down</kbd> PDF pages</li>
               <li><kbd>Esc</kbd> Close find or dialog</li>
             </ul>
-            <button type="button" onClick={() => setShortcuts(false)}>Close</button>
+            <div class="modal-actions">
+              <button type="button" onClick={() => setShortcuts(false)}>Close</button>
+            </div>
           </div>
         </div>
       ) : null}
@@ -542,7 +665,9 @@ export function App() {
             <h2 id="blocked-title">Link blocked</h2>
             <p>Reader only opens http and https links, and only after you confirm. This address was not opened.</p>
             <p class="link-url">{blockedLink}</p>
-            <button type="button" onClick={() => setBlockedLink(null)}>Close</button>
+            <div class="modal-actions">
+              <button type="button" onClick={() => setBlockedLink(null)}>Close</button>
+            </div>
           </div>
         </div>
       ) : null}
@@ -605,9 +730,4 @@ function OutlineList(props: { items: OutlineItem[]; onJump: (page: number) => vo
       ))}
     </ul>
   );
-}
-
-function clampZoom(value: number): number {
-  if (!Number.isFinite(value)) return 1;
-  return Math.min(6, Math.max(0.25, Math.round(value * 100) / 100));
 }

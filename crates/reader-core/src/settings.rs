@@ -35,6 +35,14 @@ pub struct Settings {
     pub positions: Vec<ReadingPosition>,
     #[serde(default)]
     pub remote_allowed: Vec<String>,
+    #[serde(default = "default_true")]
+    pub chrome_auto_hide: bool,
+    #[serde(default = "default_true")]
+    pub gesture_zoom: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -52,6 +60,8 @@ impl Default for Settings {
             recent: Vec::new(),
             positions: Vec::new(),
             remote_allowed: Vec::new(),
+            chrome_auto_hide: true,
+            gesture_zoom: true,
         }
     }
 }

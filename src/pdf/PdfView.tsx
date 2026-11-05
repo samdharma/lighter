@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import type { PDFDocumentProxy, RenderTask } from "pdfjs-dist";
 import { confirmOpenExternal, errorText, markPerf, reclassifyFailedPdf } from "../lib/bridge";
+import { PageCache } from "../lib/pageCache";
 import type { Opened, OutlineItem, ScaleMode } from "../types";
 
 type Hit = { page: number; item: number };
@@ -28,10 +29,21 @@ type PasswordPrompt = {
   submit: (password: string | null) => void;
 };
 
+const CACHE_PAGES = 16;
+const RENDER_AHEAD = "125% 0px";
+const FLING_VELOCITY = 1.2; // px per ms; above this, defer rendering
+const SETTLE_MS = 150;
+const REPAINT_DEBOUNCE_MS = 140;
+
 export function PdfView(props: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const pdfRef = useRef<PDFDocumentProxy | null>(null);
   const hitsRef = useRef<Hit[]>([]);
+  const pageRef = useRef(1);
+  const paintedScaleRef = useRef(0);
+  const zoomPendingRef = useRef(false);
+  const repaintTimer = useRef<number | undefined>(undefined);
+  const prevDeps = useRef<{ viewMode: string; scaleMode: string; rotation: number; token: number } | null>(null);
   const [prompt, setPrompt] = useState<PasswordPrompt | null>(null);
   const [status, setStatus] = useState("Opening PDF…");
   const [failed, setFailed] = useState<string | null>(null);
@@ -42,6 +54,7 @@ export function PdfView(props: Props) {
     let destroyed = false;
     let loading: { destroy: () => Promise<void> } | null = null;
     const renders = new Set<RenderTask>();
+    const cleanups: Array<() => void> = [];
     setFailed(null);
     setStatus("Opening PDF…");
     pdfRef.current = null;
@@ -139,6 +152,15 @@ export function PdfView(props: Props) {
       if (destroyed) return;
       const base = first.getViewport({ scale: 1, rotation: normalize(first.rotate + props.rotation) });
       const effective = resolveScale(props.scaleMode, props.scale, base.width, base.height, scroll);
+      const startPage = props.initialPage && props.initialPage > 0 ? props.initialPage : 1;
+      pageRef.current = startPage;
+      paintedScaleRef.current = effective;
+      prevDeps.current = {
+        viewMode: props.viewMode,
+        scaleMode: props.scaleMode,
+        rotation: props.rotation,
+        token: props.pageRequest?.token ?? 0,
+      };
       await paintDocument({
         pdf,
         scroll,
@@ -146,12 +168,18 @@ export function PdfView(props: Props) {
         viewMode: props.viewMode,
         rotation: props.rotation,
         scale: effective,
-        page: props.initialPage && props.initialPage > 0 ? props.initialPage : 1,
+        estimate: { width: base.width * effective, height: base.height * effective },
+        page: startPage,
         renders,
+        cleanups,
         destroyed: () => destroyed,
-        onPage: (page) => props.onMetrics({ page, pages: pdf.numPages, scale: effective }),
+        zoomPending: zoomPendingRef,
+        onPage: (page) => {
+          pageRef.current = page;
+          props.onMetrics({ page, pages: pdf.numPages, scale: effective });
+        },
       });
-      props.onMetrics({ page: props.initialPage || 1, pages: pdf.numPages, scale: effective });
+      props.onMetrics({ page: startPage, pages: pdf.numPages, scale: effective });
       void markPerf("pdf_first_page");
       void loadOutline(pdf, props.onOutline);
     };
@@ -159,6 +187,7 @@ export function PdfView(props: Props) {
     void run();
     return () => {
       destroyed = true;
+      cleanups.forEach((fn) => fn());
       renders.forEach((task) => task.cancel());
       void loading?.destroy();
       void pdfRef.current?.loadingTask.destroy();
@@ -172,12 +201,32 @@ export function PdfView(props: Props) {
     if (!pdf || !scroll || failed) return;
     let destroyed = false;
     const renders = new Set<RenderTask>();
+    const cleanups: Array<() => void> = [];
+    const prev = prevDeps.current;
+    const next = {
+      viewMode: props.viewMode,
+      scaleMode: props.scaleMode,
+      rotation: props.rotation,
+      token: props.pageRequest?.token ?? 0,
+    };
+    prevDeps.current = next;
+    const onlyScale =
+      prev !== null &&
+      paintedScaleRef.current > 0 &&
+      prev.viewMode === next.viewMode &&
+      prev.scaleMode === next.scaleMode &&
+      prev.rotation === next.rotation &&
+      prev.token === next.token;
+
     const apply = async () => {
+      zoomPendingRef.current = false;
       const pdfjs = await import("pdfjs-dist");
-      const pageNo = currentPage(scroll);
+      const pageNo = pageRef.current;
       const page = await pdf.getPage(pageNo);
+      if (destroyed) return;
       const base = page.getViewport({ scale: 1, rotation: normalize(page.rotate + props.rotation) });
       const effective = resolveScale(props.scaleMode, props.scale, base.width, base.height, scroll);
+      paintedScaleRef.current = effective;
       await paintDocument({
         pdf,
         scroll,
@@ -185,16 +234,36 @@ export function PdfView(props: Props) {
         viewMode: props.viewMode,
         rotation: props.rotation,
         scale: effective,
+        estimate: { width: base.width * effective, height: base.height * effective },
         page: props.pageRequest?.page || pageNo,
         renders,
+        cleanups,
         destroyed: () => destroyed,
-        onPage: (pageNumber) => props.onMetrics({ page: pageNumber, pages: pdf.numPages, scale: effective }),
+        zoomPending: zoomPendingRef,
+        onPage: (pageNumber) => {
+          pageRef.current = pageNumber;
+          props.onMetrics({ page: pageNumber, pages: pdf.numPages, scale: effective });
+        },
       });
       paintHitClasses(scroll, hitsRef.current, props.cursor);
     };
+
+    if (onlyScale && props.scaleMode === "custom") {
+      // Gesture/keyboard zoom: stretch rendered pages with a CSS transform for
+      // instant feedback, then repaint crisply once the gesture settles.
+      const target = clampScale(props.scale);
+      previewZoom(scroll, target / paintedScaleRef.current);
+      zoomPendingRef.current = true;
+      repaintTimer.current = window.setTimeout(() => void apply(), REPAINT_DEBOUNCE_MS);
+      return () => {
+        destroyed = true;
+        window.clearTimeout(repaintTimer.current);
+      };
+    }
     void apply();
     return () => {
       destroyed = true;
+      cleanups.forEach((fn) => fn());
       renders.forEach((task) => task.cancel());
     };
   }, [props.viewMode, props.scaleMode, props.scale, props.rotation, props.pageRequest?.token]);
@@ -210,7 +279,6 @@ export function PdfView(props: Props) {
       paintHitClasses(scrollRef.current, [], 0);
       return;
     }
-    const generation = Symbol();
     void (async () => {
       const hits: Hit[] = [];
       const needle = query.toLowerCase();
@@ -233,7 +301,6 @@ export function PdfView(props: Props) {
       const hit = hits[props.cursor] ?? hits[0];
       if (hit) scrollRef.current?.querySelector(`[data-page="${hit.page}"]`)?.scrollIntoView({ block: "center" });
       paintHitClasses(scrollRef.current, hits, props.cursor);
-      void generation;
     })();
     return () => {
       cancelled = true;
@@ -248,7 +315,7 @@ export function PdfView(props: Props) {
   }, [props.cursor]);
 
   return (
-    <div class="pdf-scroll" ref={scrollRef} onScroll={onScroll}>
+    <div class="pdf-scroll" ref={scrollRef}>
       {failed ? <p class="banner error">{failed}</p> : null}
       {!failed && status ? <p class="banner">{status}</p> : null}
       {prompt ? (
@@ -276,17 +343,6 @@ export function PdfView(props: Props) {
       ) : null}
     </div>
   );
-
-  function onScroll() {
-    const scroll = scrollRef.current;
-    const pdf = pdfRef.current;
-    if (!scroll || !pdf) return;
-    props.onMetrics({
-      page: currentPage(scroll),
-      pages: pdf.numPages,
-      scale: props.scale,
-    });
-  }
 }
 
 function normalize(value: number): number {
@@ -307,21 +363,12 @@ function clampScale(value: number): number {
   return Math.min(6, Math.max(0.25, value));
 }
 
-function currentPage(scroll: HTMLElement): number {
-  const pages = [...scroll.querySelectorAll<HTMLElement>("[data-page]")];
-  if (!pages.length) return 1;
-  const top = scroll.getBoundingClientRect().top;
-  let best = pages[0];
-  let bestDelta = Number.POSITIVE_INFINITY;
-  for (const page of pages) {
-    if (page.hidden) continue;
-    const delta = Math.abs(page.getBoundingClientRect().top - top - 12);
-    if (delta < bestDelta) {
-      best = page;
-      bestDelta = delta;
-    }
-  }
-  return Number(best.dataset.page || "1");
+function previewZoom(scroll: HTMLElement, ratio: number): void {
+  if (!Number.isFinite(ratio) || ratio <= 0) return;
+  scroll.querySelectorAll<HTMLElement>("[data-page]").forEach((slot) => {
+    slot.style.transformOrigin = "50% 0";
+    slot.style.transform = ratio === 1 ? "" : `scale(${ratio})`;
+  });
 }
 
 async function paintDocument(args: {
@@ -331,20 +378,24 @@ async function paintDocument(args: {
   viewMode: "continuous" | "single";
   rotation: number;
   scale: number;
+  estimate: { width: number; height: number };
   page: number;
   renders: Set<RenderTask>;
+  cleanups: Array<() => void>;
   destroyed: () => boolean;
+  zoomPending: { current: boolean };
   onPage: (page: number) => void;
 }): Promise<void> {
   const { pdf, scroll, pdfjs } = args;
-  const keepScroll = scroll.scrollTop;
   scroll.querySelectorAll("[data-page]").forEach((node) => node.remove());
   const slots: HTMLElement[] = [];
+  const offsets: number[] = [];
   for (let number = 1; number <= pdf.numPages; number += 1) {
     const slot = document.createElement("article");
     slot.className = "pdf-page";
     slot.dataset.page = String(number);
-    slot.style.minHeight = "960px";
+    slot.style.width = `${args.estimate.width}px`;
+    slot.style.height = `${args.estimate.height}px`;
     const label = document.createElement("p");
     label.className = "pdf-page-label";
     label.textContent = String(number);
@@ -353,11 +404,37 @@ async function paintDocument(args: {
     scroll.append(slot);
     slots.push(slot);
   }
-  const target = Math.min(Math.max(args.page, 1), pdf.numPages);
-  slots[target - 1]?.scrollIntoView();
-  if (keepScroll && args.viewMode === "continuous" && args.page === currentPage(scroll)) {
-    scroll.scrollTop = keepScroll;
-  }
+
+  const syncOffsets = () => {
+    offsets.length = 0;
+    const base = slots[0]?.offsetTop ?? 0;
+    for (const slot of slots) offsets.push(slot.offsetTop - base);
+  };
+  syncOffsets();
+
+  const locate = (): number => {
+    if (args.viewMode === "single" || !offsets.length) return args.page;
+    const target = scroll.scrollTop + 24;
+    let low = 0;
+    let high = offsets.length - 1;
+    let best = 0;
+    while (low <= high) {
+      const mid = (low + high) >> 1;
+      if (offsets[mid] <= target) {
+        best = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    return best + 1;
+  };
+
+  const cache = new PageCache<HTMLElement>(CACHE_PAGES, (slot) => {
+    slot.querySelectorAll("canvas, .textLayer, .pdf-link").forEach((node) => node.remove());
+    delete slot.dataset.ready;
+  });
+  args.cleanups.push(() => cache.clear());
 
   const renderSlot = async (slot: HTMLElement) => {
     if (args.destroyed() || slot.dataset.ready === "1") return;
@@ -368,9 +445,9 @@ async function paintDocument(args: {
       scale: args.scale,
       rotation: normalize(page.rotate + args.rotation),
     });
-    slot.style.minHeight = "";
     slot.style.width = `${viewport.width}px`;
     slot.style.height = `${viewport.height}px`;
+    syncOffsets();
     const canvas = document.createElement("canvas");
     const ratio = Math.min(window.devicePixelRatio || 1, 2);
     let pixelWidth = Math.floor(viewport.width * ratio);
@@ -440,30 +517,69 @@ async function paintDocument(args: {
       }
       slot.append(link);
     }
-    if (number === 1) args.onPage(1);
+    cache.set(number, slot, locate());
   };
 
-  await renderSlot(slots[0] ?? slots[target - 1]);
-  if (args.viewMode === "single") {
-    const slot = slots[target - 1];
-    if (slot && slot !== slots[0]) await renderSlot(slot);
-    return;
-  }
+  const target = Math.min(Math.max(args.page, 1), pdf.numPages);
+  slots[target - 1]?.scrollIntoView();
+  await renderSlot(slots[target - 1] ?? slots[0]);
+  args.onPage(locate());
+
+  const pending = new Set<HTMLElement>();
+  let flinging = false;
+  let lastTop = scroll.scrollTop;
+  let lastTime = performance.now();
+  let settleTimer = 0;
+  let rafId = 0;
+
+  const settle = () => {
+    flinging = false;
+    if (args.destroyed()) return;
+    for (const slot of pending) void renderSlot(slot);
+    pending.clear();
+    args.onPage(locate());
+  };
+
+  const onScroll = () => {
+    const now = performance.now();
+    const dy = Math.abs(scroll.scrollTop - lastTop);
+    const dt = Math.max(now - lastTime, 1);
+    lastTop = scroll.scrollTop;
+    lastTime = now;
+    if (dy / dt > FLING_VELOCITY) {
+      flinging = true;
+      window.clearTimeout(settleTimer);
+      settleTimer = window.setTimeout(settle, SETTLE_MS);
+    }
+    if (rafId) return;
+    rafId = requestAnimationFrame(() => {
+      rafId = 0;
+      if (!args.destroyed()) args.onPage(locate());
+    });
+  };
+  scroll.addEventListener("scroll", onScroll, { passive: true });
+  args.cleanups.push(() => {
+    scroll.removeEventListener("scroll", onScroll);
+    window.clearTimeout(settleTimer);
+    if (rafId) cancelAnimationFrame(rafId);
+  });
+
   const observer = new IntersectionObserver(
     (entries) => {
       for (const entry of entries) {
         const slot = entry.target as HTMLElement;
-        if (entry.isIntersecting) void renderSlot(slot);
-        else if (slot.dataset.ready === "1") {
-          slot.querySelector("canvas")?.remove();
-          slot.querySelector(".textLayer")?.remove();
-          delete slot.dataset.ready;
+        if (!entry.isIntersecting) {
+          pending.delete(slot);
+          continue;
         }
+        if (flinging || args.zoomPending.current) pending.add(slot);
+        else void renderSlot(slot);
       }
     },
-    { root: scroll, rootMargin: "35% 0px" },
+    { root: scroll, rootMargin: RENDER_AHEAD },
   );
   for (const slot of slots) observer.observe(slot);
+  args.cleanups.push(() => observer.disconnect());
 }
 
 async function followDest(pdf: PDFDocumentProxy, dest: unknown, scroll: HTMLElement): Promise<void> {

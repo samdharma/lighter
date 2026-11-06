@@ -22,7 +22,8 @@ import {
   setRemoteAllowed,
   updateSettings,
 } from "./lib/bridge";
-import type { Opened, OutlineItem, ScaleMode, Settings } from "./types";
+import { POSITION_SAVE_DELAY_MS, normalizeRatio, samePosition } from "./lib/position";
+import type { Opened, OutlineItem, ReadingPosition, ScaleMode, Settings } from "./types";
 
 type Phase =
   | { kind: "empty" }
@@ -459,6 +460,7 @@ export function App() {
                 void adopt(info);
               }}
               onError={(message) => setPhase({ kind: "error", message })}
+              onLink={setPendingLink}
             />
           ) : null}
         </main>
@@ -677,25 +679,82 @@ export function App() {
   );
 }
 
+const POSITION_SCOPE = ".pdf-scroll, .raw-wrap, .markdown";
+
+// Saves the reading spot once the reader has been still for a moment, so page
+// turns, scrolls and relayouts do not each rewrite the settings file.
 function PositionSaver(props: { phase: Phase; page: number }) {
-  const phase = props.phase;
+  const timer = useRef<number | undefined>(undefined);
+  const pending = useRef<ReadingPosition | null>(null);
+  const saved = useRef<ReadingPosition | null>(null);
+  const flush = useRef<(fresh: boolean) => void>(() => undefined);
+  const schedule = useRef<() => void>(() => undefined);
+
+  const ratioOf = (scroller: HTMLElement | null): number => {
+    if (!scroller) return 0;
+    return normalizeRatio(scroller.scrollTop / Math.max(scroller.scrollHeight - scroller.clientHeight, 1));
+  };
+
+  flush.current = (fresh: boolean) => {
+    window.clearTimeout(timer.current);
+    timer.current = undefined;
+    const last = pending.current;
+    if (!last || !inShell()) return;
+    const scroller = fresh ? document.querySelector<HTMLElement>(POSITION_SCOPE) : null;
+    const next: ReadingPosition = {
+      path: last.path,
+      page: last.page,
+      anchor: last.anchor,
+      // If the document view is already gone, keep the last measured ratio
+      // instead of writing a 0 that would rewind the saved spot to page top.
+      scrollRatio: scroller ? ratioOf(scroller) : last.scrollRatio,
+    };
+    if (samePosition(next, saved.current)) return;
+    saved.current = next;
+    void rememberPosition(next).catch(() => {
+      saved.current = null;
+    });
+  };
+
+  schedule.current = () => {
+    window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => flush.current(true), POSITION_SAVE_DELAY_MS);
+  };
+
   useEffect(() => {
-    if (!inShell() || (phase.kind !== "pdf" && phase.kind !== "md")) return;
-    const path = phase.info.path;
-    const timer = window.setTimeout(() => {
-      const scroller = document.querySelector(".pdf-scroll, .raw-wrap, .markdown");
-      const ratio = scroller ? scroller.scrollTop / Math.max(scroller.scrollHeight - scroller.clientHeight, 1) : 0;
-      const anchor = phase.kind === "md" ? document.querySelector(".markdown h1, .markdown h2")?.id ?? null : null;
-      void rememberPosition({
-        path,
-        page: phase.kind === "pdf" ? props.page : null,
-        anchor,
-        scrollRatio: Number.isFinite(ratio) ? ratio : 0,
-      });
-    }, 400);
-    return () => window.clearTimeout(timer);
-  }, [phase, props.page]);
+    if (!inShell() || (props.phase.kind !== "pdf" && props.phase.kind !== "md")) {
+      flush.current(false);
+      pending.current = null;
+      return;
+    }
+    const info = props.phase.info;
+    if (pending.current && pending.current.path !== info.path) flush.current(false);
+    pending.current = {
+      path: info.path,
+      page: props.phase.kind === "pdf" ? props.page : null,
+      anchor: props.phase.kind === "md" ? markdownAnchor() : null,
+      scrollRatio: ratioOf(document.querySelector<HTMLElement>(POSITION_SCOPE)),
+    };
+    schedule.current();
+  }, [props.phase, props.page]);
+
+  useEffect(() => {
+    if (!inShell()) return;
+    const onScroll = (event: Event) => {
+      if ((event.target as HTMLElement | null)?.matches?.(POSITION_SCOPE)) schedule.current();
+    };
+    document.addEventListener("scroll", onScroll, { capture: true, passive: true });
+    return () => {
+      document.removeEventListener("scroll", onScroll, { capture: true });
+      flush.current(true);
+    };
+  }, []);
+
   return null;
+}
+
+function markdownAnchor(): string | null {
+  return document.querySelector<HTMLElement>(".markdown h1, .markdown h2")?.id ?? null;
 }
 
 function RecentHint(props: { recent: string[]; visible: boolean; onClear: () => void; onOpen: (path: string) => void }) {

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import type { PDFDocumentProxy, RenderTask } from "pdfjs-dist";
-import { confirmOpenExternal, errorText, markPerf, reclassifyFailedPdf } from "../lib/bridge";
+import { errorText, markPerf, reclassifyFailedPdf } from "../lib/bridge";
 import { PageCache } from "../lib/pageCache";
 import type { Opened, OutlineItem, ScaleMode } from "../types";
 
@@ -22,6 +22,7 @@ type Props = {
   onCount: (count: number, running: boolean) => void;
   onReclassified: (info: Opened) => void;
   onError: (message: string) => void;
+  onLink: (href: string) => void;
 };
 
 type PasswordPrompt = {
@@ -174,6 +175,7 @@ export function PdfView(props: Props) {
         cleanups,
         destroyed: () => destroyed,
         zoomPending: zoomPendingRef,
+        onLink: props.onLink,
         onPage: (page) => {
           pageRef.current = page;
           props.onMetrics({ page, pages: pdf.numPages, scale: effective });
@@ -240,6 +242,7 @@ export function PdfView(props: Props) {
         cleanups,
         destroyed: () => destroyed,
         zoomPending: zoomPendingRef,
+        onLink: props.onLink,
         onPage: (pageNumber) => {
           pageRef.current = pageNumber;
           props.onMetrics({ page: pageNumber, pages: pdf.numPages, scale: effective });
@@ -384,6 +387,7 @@ async function paintDocument(args: {
   cleanups: Array<() => void>;
   destroyed: () => boolean;
   zoomPending: { current: boolean };
+  onLink: (href: string) => void;
   onPage: (page: number) => void;
 }): Promise<void> {
   const { pdf, scroll, pdfjs } = args;
@@ -503,11 +507,9 @@ async function paintDocument(args: {
       link.style.width = `${Math.abs(x2 - x1)}px`;
       link.style.height = `${Math.abs(y2 - y1)}px`;
       if (annotation.url) {
-        link.dataset.external = annotation.url;
         link.addEventListener("click", (event) => {
           event.preventDefault();
-          const ok = window.confirm(`Open this link in your browser?\n\n${annotation.url}`);
-          if (ok) void confirmOpenExternal(annotation.url);
+          args.onLink(annotation.url);
         });
       } else if (annotation.dest) {
         link.addEventListener("click", (event) => {
